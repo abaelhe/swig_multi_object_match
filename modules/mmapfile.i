@@ -21,12 +21,14 @@ struct cpp_string{
   std::string val;
 };
 
+extern int         mmapfile_debug(int debug);
 extern std::string mmapfile_status();
 extern char       *mmapfile_init(std::string mmap_file_path);
 extern std::string mmapfile_compute_fingerprints(const char *csv_data, int nlargest);
 
 %}
 
+extern int         mmapfile_debug(int debug);
 extern char       *mmapfile_init(std::string mmap_file_path);
 extern std::string mmapfile_status();
 extern std::string mmapfile_compute_fingerprints(const char *csv_data, int nlargest);

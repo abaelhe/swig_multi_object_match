@@ -5,20 +5,51 @@ using namespace std;
 using namespace engine;
 
 
-typedef unordered_map<uint32_t, std::pair<string, string>> FPMatchDict;
-typedef unordered_map<uint16_t, uint32_t> FPDiffsMap;
+typedef unordered_map<uint32_t, char *> FPMatchDict;
+typedef unordered_map<int16_t, uint32_t> FPDiffsMap;
 typedef unordered_map<uint32_t, FPDiffsMap> FPTicketsMap;
 typedef std::pair<uint32_t, uint32_t>  FPRankPair;
 
+static int debug_mode = 0;
+static long PAGE_SIZE = 0;
+static uint32_t indexed_hash_ids_num = 0;
 
 static  FPMatchDict *BIG_DICT = NULL;
 static  MmapFile *mmapFile = NULL;
 static char *MMAP_POINTER = NULL;
-static uint64_t indexed_hash_ids_num = 0;
+
+
+int mmapfile_debug(int debug){
+    debug_mode = debug;
+    return debug_mode;
+};
 
 bool fingerprint_rank_function(FPRankPair &i, FPRankPair &j){
     return i.first > j.first;
 }
+
+uint32_t get_fingerprint_diff_tickets(FPTicketsMap &fptm, uint32_t songid, int16_t diff){
+    uint32_t val = fptm[songid][diff];
+    return val;
+}
+
+uint32_t get_fingerprint_diffs(FPTicketsMap &fptm, uint32_t songid){
+    FPDiffsMap &diffs = fptm[songid];
+    DEBUG("songid: %d\n", songid);
+    uint32_t max_tickets = 0;
+    for(FPDiffsMap::const_iterator it=diffs.begin(); it != diffs.end(); ++it){
+        int16_t diff = it->first;
+        uint32_t tickets = it->second;
+        if(tickets > max_tickets){
+            max_tickets = tickets;
+        }
+        DEBUG("    %d: %d\n", diff, tickets);
+    }
+
+    DEBUG("songid: %d, max_tickets:%d\n", songid, max_tickets);
+    return max_tickets;
+}
+
 
 void fingerprint_rank(FPTicketsMap &fingerprint_tickets, string &result, int nlargest){
     vector<FPRankPair> fp_ranks;
@@ -47,6 +78,7 @@ void fingerprint_rank(FPTicketsMap &fingerprint_tickets, string &result, int nla
         fp_ranks.push_back(std::make_pair(offset_diff_tickets_max, songid));
     }
 
+    nlargest = fp_ranks.size() > nlargest ? nlargest : fp_ranks.size();
     std::partial_sort(fp_ranks.begin(), fp_ranks.begin() + nlargest, fp_ranks.end(), fingerprint_rank_function);
 
     result.resize(nlargest * 8);
@@ -68,9 +100,9 @@ string mmapfile_compute_fingerprints(const char *csv_data, int nlargest=5){
 
     FPTicketsMap FingerprintTickets;
 
-    char a, *p = (char *)csv_data, *s;
-    uint32_t hash_id, offset_idx, offset_diff, offset_tickets, offsets_num;
-    uint16_t offset, offset_val, *offset_ptr;
+    char a, *p = (char *)csv_data, *s, *o;
+    uint32_t hash_id, offset_idx, offsets_num, *songid_ptr;
+    uint16_t offset, *offset_ptr;
     bool matched_hash_id = false;
 
     while(1){
@@ -97,14 +129,12 @@ string mmapfile_compute_fingerprints(const char *csv_data, int nlargest=5){
 
                 FPMatchDict::const_iterator got = BIG_DICT->find(hash_id);
                 if(got == BIG_DICT->end())continue;
-                const string &offsets = got->second.first;
-                offsets_num = offsets.size()/2;
-                offset_ptr = (uint16_t *)offsets.c_str();
+                o = got->second;
+                offsets_num = *(uint32_t *)o;
+                offset_ptr = (uint16_t *)(o + 4);
+                songid_ptr = (uint32_t *)(offset_ptr + offsets_num);
                 for(offset_idx=0; offset_idx < offsets_num; offset_idx++){
-                    offset_val = offset_ptr[offset_idx];
-                    offset_diff = offset_val - offset;
-                    offset_tickets = FingerprintTickets[hash_id][offset_diff];
-                    FingerprintTickets[hash_id][offset_diff] = offset_tickets + 1;
+                    FingerprintTickets[songid_ptr[offset_idx]][offset_ptr[offset_idx]-offset]++;
                 }
             }
             matched_hash_id = false;
@@ -122,66 +152,73 @@ string mmapfile_compute_fingerprints(const char *csv_data, int nlargest=5){
     return result;
 }
 
+size_t read_nbytes(int fd, char *p, size_t n){
+    ssize_t num;
+    size_t readed_num = 0;
 
-void load_mmap_index(FPMatchDict &fp_dict, char *mmap_start, uint32_t hash_ids_num, uint64_t stored_file_size){
-    DEBUG("Loading: hash_ids_num:%ld, file_size:%lld ...\n", hash_ids_num, stored_file_size);
-    fp_dict.reserve(hash_ids_num);
-
-    uint32_t hash_id;
-    uint32_t offsets_num;
-    uint32_t index = 0;
-    uint32_t *h = (uint32_t *)(mmap_start + HEADER_SIZE);
-    char *p = mmap_start + HEADER_SIZE + hash_ids_num * 4;
-    while (index < hash_ids_num){
-        hash_id = *h++;
-        offsets_num = *((uint32_t *)p);
-        p+=4;
-        fp_dict[hash_id] = std::make_pair(string(p, 2*offsets_num), string(p + 2*offsets_num, offsets_num * 4));
-        p += offsets_num * (2+4);
-        index++;
-        if(index % 100000 == 0){
-            DEBUG("    %ld.\n", index);
+    while (readed_num < n){
+        num = read(fd, p + readed_num, n - readed_num);
+        if(-1 == num){
+            int _err = errno;
+            FATAL("Error, read_nbytes, fd:%d, errno:%d, %s\n", fd, _err, strerror(_err));
+            return -1;
         }
 
+        if(0 == num)break;
+        readed_num += num;
     }
 
-    if((p - mmap_start) == stored_file_size){
-        DEBUG("You are lucky, this MUST be the right place.\n");
-    }
+    return readed_num;
 }
 
 char *mmapfile_init(string mmap_file_path){
     if (MMAP_POINTER != NULL)return MMAP_POINTER;
 
+#define ERROR_IF(_a, _err_str) \
+    if(_a){ \
+        int _err = errno; \
+        FATAL("Error, %s, file:%s, errno:%d, %s\n", (_err_str), mmap_file_path.c_str(), _err, strerror(_err)); \
+        return NULL; \
+    }
+
+    ERROR_IF(((PAGE_SIZE=sysconf(_SC_PAGE_SIZE)) == -1), "sysconf(_SC_PAGE_SIZE)");
+    ERROR_IF((!fileExists(mmap_file_path)), "file not exist!");
     mmapFile = new MmapFile();
     mmapFile->Initialize(mmap_file_path, 0, false); //Read
     uint64_t size = mmapFile->Size();
-    MMAP_POINTER = (char *) mmap(NULL, size, PROT_READ, MAP_FILE | MAP_SHARED, mmapFile->GetFd(), 0);
-    if (MMAP_POINTER == MAP_FAILED) {
-        MMAP_POINTER = NULL;
-        int err = errno;
-        FATAL("Unable to mmap: (%d) %s", err, strerror(err));
-        return NULL;
-    }
-
-    if(size < HEADER_SIZE){
-        return NULL;
-    }
+    ERROR_IF((size < HEADER_SIZE), "index size less than HEADER_SIZE.");
+    MMAP_POINTER = (char *) mmap(NULL, size, PROT_READ, MAP_FILE | MAP_PRIVATE | MAP_NOCACHE | MAP_NOEXTEND, mmapFile->GetFd(), 0);
+    ERROR_IF((MMAP_POINTER == MAP_FAILED), "mmap.");
 
     uint64_t stored_file_size = *((uint64_t *)MMAP_POINTER);
-    uint32_t hash_ids_num = *(uint32_t *)(MMAP_POINTER + 8);
+    uint32_t hash_ids_num  = indexed_hash_ids_num = *(uint32_t *)((char *)MMAP_POINTER + 8);
 
     BIG_DICT  = new FPMatchDict;
-    if (BIG_DICT == NULL) {
-        int err = errno;
-        FATAL("Unable to new class MatchIndexMap & FPMatchDict, %d, %s", err, strerror(err));
+    ERROR_IF((BIG_DICT == NULL), "new FPMatchDict");
+    BIG_DICT->reserve(hash_ids_num);
+    FPMatchDict &fp_dict = *BIG_DICT;
+
+    DEBUG("Loading: hash_ids_num:%u, file_size:%lu ...\n", hash_ids_num, stored_file_size);
+    uint32_t index = 0, *hashid_array = (uint32_t*)(MMAP_POINTER + HEADER_SIZE);
+    char *p = MMAP_POINTER + HEADER_SIZE + hash_ids_num * 4;
+    while (index < hash_ids_num){
+        if(index % int(hash_ids_num / 10) == 0){DEBUG("   %0.2f%%.\n", index*100.0/hash_ids_num);}
+        fp_dict[hashid_array[index]] = p;
+        p += (4 + *((uint32_t *)p) * (2+4));
+        index++;
+    }
+
+    if((uint64_t)(p - MMAP_POINTER) != stored_file_size){
+        FATAL("Error read index size:%ld", stored_file_size);
+        munmap(MMAP_POINTER, size);
         return NULL;
     }
 
-    BIG_DICT->reserve(hash_ids_num);
-    load_mmap_index(*BIG_DICT, MMAP_POINTER, hash_ids_num, stored_file_size);
-
+    ERROR_IF((-1 == munmap(MMAP_POINTER, PAGE_SIZE * ((HEADER_SIZE + hash_ids_num * 4) / PAGE_SIZE))), "munmap hashids segment.");
+    MMAP_POINTER += (PAGE_SIZE * ((HEADER_SIZE + hash_ids_num * 4) / PAGE_SIZE));
+    DEBUG("You are lucky, this MUST be the right place.\n");
     return MMAP_POINTER;
+#undef ERROR_IF
 }
 
 string mmapfile_status(){
