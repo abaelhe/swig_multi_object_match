@@ -5,13 +5,15 @@ using namespace std;
 using namespace engine;
 
 
+typedef vector<uint64_t> FPQueryVector;
 typedef unordered_map<uint32_t, char *> FPMatchDict;
 typedef unordered_map<int16_t, uint32_t> FPDiffsMap;
 typedef unordered_map<uint32_t, FPDiffsMap> FPTicketsMap;
-typedef std::pair<uint32_t, uint32_t>  FPRankPair;
-
+typedef std::unordered_map<uint32_t, uint32_t> FPRankMap;
+typedef std::pair<uint32_t, uint32_t> FPRankPair;
 static int debug_mode = 0;
 static long PAGE_SIZE = 0;
+static uint32_t SONG_TICKETS_HIGH_WATER = 1000;
 static uint32_t indexed_hash_ids_num = 0;
 
 static  FPMatchDict *BIG_DICT = NULL;
@@ -24,19 +26,16 @@ int mmapfile_debug(int debug){
     return debug_mode;
 };
 
-bool fingerprint_rank_function(FPRankPair &i, FPRankPair &j){
-    return i.first > j.first;
-}
-
-uint32_t get_fingerprint_diff_tickets(FPTicketsMap &fptm, uint32_t songid, int16_t diff){
+uint32_t dbg_fingerprint_diff_tickets(FPTicketsMap &fptm, uint32_t songid, int16_t diff){
     uint32_t val = fptm[songid][diff];
     return val;
 }
 
-uint32_t get_fingerprint_diffs(FPTicketsMap &fptm, uint32_t songid){
+uint32_t dbg_fingerprint_diffs(FPTicketsMap &fptm, uint32_t songid){
     FPDiffsMap &diffs = fptm[songid];
     DEBUG("songid: %d\n", songid);
     uint32_t max_tickets = 0;
+
     for(FPDiffsMap::const_iterator it=diffs.begin(); it != diffs.end(); ++it){
         int16_t diff = it->first;
         uint32_t tickets = it->second;
@@ -50,125 +49,152 @@ uint32_t get_fingerprint_diffs(FPTicketsMap &fptm, uint32_t songid){
     return max_tickets;
 }
 
-
-void fingerprint_rank(FPTicketsMap &fingerprint_tickets, string &result, int nlargest){
-    vector<FPRankPair> fp_ranks;
-
-    uint32_t songid, offset_diff_tickets_max;
-    FPTicketsMap::iterator it;
-    FPDiffsMap::iterator ti;
-    size_t tickets_size = fingerprint_tickets.size(), diffs_size;
-
-    while(tickets_size-- > 0){
-        it=fingerprint_tickets.begin();
-        songid = it->first;
-        FPDiffsMap & tickets = it->second;
-
-        offset_diff_tickets_max = 0;
-        diffs_size = tickets.size();
-        while(diffs_size-- >0){
-            ti = tickets.begin();
-            if (ti->second > offset_diff_tickets_max){
-                offset_diff_tickets_max = ti->second;
-            }
-            tickets.erase(ti);
-        }
-
-        fingerprint_tickets.erase(it);
-        fp_ranks.push_back(std::make_pair(offset_diff_tickets_max, songid));
-    }
-
-    nlargest = fp_ranks.size() > nlargest ? nlargest : fp_ranks.size();
-    std::partial_sort(fp_ranks.begin(), fp_ranks.begin() + nlargest, fp_ranks.end(), fingerprint_rank_function);
-
-    result.resize(nlargest * 8);
-    uint32_t *x = (uint32_t *)result.c_str();
-
-    for(int i=0; i< nlargest; i++){
-        FPRankPair &m = fp_ranks[i];
-        *x = m.first;
-        x[nlargest] = m.second;
-        x++;
-    }
+static inline bool FPRankPartial(FPRankPair &x, FPRankPair &y){
+    return x.first  > y.first;
 }
 
+static inline bool fingerprint_parse_csv_query(char *csv_data, FPQueryVector &fpQuery){
+# define CSV_DATA_FIELDS_NUM 2
+    size_t field_index;
+    const char *line_sep = "\r\n", *field_sep = ",";
+    char *line, *_line_ctx, *field, *_field_ctx;
+    char *fields_ptr[CSV_DATA_FIELDS_NUM];
 
-string mmapfile_compute_fingerprints(const char *csv_data, int nlargest=5){
+    uint32_t hash_id;
+    uint16_t offset;
+
+    for (line = strtok_r(csv_data, line_sep, &_line_ctx); line; line = strtok_r(NULL, line_sep, &_line_ctx)){
+        field_index = 0;
+        for (field = strtok_r(line, field_sep, &_field_ctx); field; field = strtok_r(NULL, field_sep, &_field_ctx)){
+            fields_ptr[field_index%CSV_DATA_FIELDS_NUM] = field;
+            field_index++;
+            if (field_index >= CSV_DATA_FIELDS_NUM)break;
+        }
+
+        hash_id = atoi(fields_ptr[0]);
+        offset = atoi(fields_ptr[1]);
+
+        fpQuery.push_back((uint64_t)offset<<32 | (uint64_t)hash_id);
+    }
+
+    return true;
+}
+
+static inline bool fingerprint_parse_hashid_offsets(FPQueryVector &fpQuery, FPRankMap &fpsmtm){
+    uint32_t hash_id;
+    uint16_t offset, *offset_ptr;
+    uint64_t hash_id_offset;
+
+    uint64_t rank_high_tickets_total=0;
+    FPRankMap rank_high_tickets;
+    FPTicketsMap fpt;
+    char *o;
+
+    uint32_t ticket_high_water = SONG_TICKETS_HIGH_WATER;
+    uint32_t offsets_num, offset_idx, *songid_ptr, songid, tickets, *songid_max_tickets;
+    for(FPQueryVector::iterator iter= fpQuery.begin(); iter != fpQuery.end(); iter++){
+        hash_id_offset = *iter;
+        hash_id =((uint32_t *)&hash_id_offset)[0];
+        offset = ((uint32_t *)&hash_id_offset)[1];
+        FPMatchDict::const_iterator got = BIG_DICT->find(hash_id);
+        if(got == BIG_DICT->end())continue;
+
+        o = got->second;
+        offsets_num = *(uint32_t *)o;
+        offset_ptr = (uint16_t *)(o + 4);
+        songid_ptr = (uint32_t *)(offset_ptr + offsets_num);
+        for(offset_idx=0; offset_idx < offsets_num; offset_idx++){
+            songid = songid_ptr[offset_idx];
+            if( rank_high_tickets.find(songid) != rank_high_tickets.end()){
+                rank_high_tickets[songid]++;
+                rank_high_tickets_total ++;
+                continue;
+            }
+
+            tickets = ++(fpt[songid][offset_ptr[offset_idx] - offset]);
+            songid_max_tickets = & fpsmtm[songid];
+            if (tickets > *songid_max_tickets){
+                *songid_max_tickets = tickets;
+            }
+
+            if(tickets >= ticket_high_water){
+                rank_high_tickets[songid] = tickets;
+                rank_high_tickets_total += tickets;
+            }
+        }
+    }
+
+    fpQuery.clear();
+    fpt.clear();
+
+    size_t normal_num = fpsmtm.size();
+    size_t rank_high_tickets_num = rank_high_tickets.size();
+    uint32_t avg_high_score = rank_high_tickets_total / rank_high_tickets.size();
+    for(FPRankMap::iterator riter=rank_high_tickets.begin(); riter != rank_high_tickets.end(); riter++){
+        songid = riter->first;
+        if(rank_high_tickets_num >= avg_high_score){
+            fpsmtm[songid] = riter->second;
+            continue;
+        }
+
+        if(normal_num != 0){
+            fpsmtm[songid] = riter->second;
+        }
+    }
+    return true;
+}
+
+static inline bool fingerprint_songs_rank(string &result, FPRankMap &fpsmtm, size_t nlargest){
+    std::vector<FPRankPair> FPRankVector;
+    size_t song_size = fpsmtm.size();
+    FPRankMap::iterator iter;
+    while(song_size-- > 0){
+        iter = fpsmtm.begin();
+        FPRankVector.push_back(std::make_pair(iter->second, iter->first));
+        fpsmtm.erase(iter);
+    }
+
+    nlargest = FPRankVector.size() > nlargest ? nlargest : FPRankVector.size();
+    std::partial_sort(FPRankVector.begin(), FPRankVector.begin() + nlargest, FPRankVector.end(), FPRankPartial);
+
+    uint32_t *rank_result_ptr = (uint32_t *)result.c_str();
+    for(size_t i=0; i< nlargest; i++){
+        *rank_result_ptr = FPRankVector[i].first;
+        rank_result_ptr[nlargest] = FPRankVector[i].second;
+        rank_result_ptr++;
+    }
+
+    return true;
+}
+
+string mmapfile_compute_fingerprints(char *csv_data, size_t nlargest=5){
     if (MMAP_POINTER == NULL){
         return "Error: call mmapfile_init to load the database first.";
     }
+    double time_start;
+    GETCLOCKS(time_start);
 
-    FPTicketsMap FingerprintTickets;
+    FPRankMap FPSongMaxTicketsMap;
+    FPQueryVector fpQuery;
 
-    char a, *p = (char *)csv_data, *s, *o;
-    uint32_t hash_id, offset_idx, offsets_num, *songid_ptr;
-    uint16_t offset, *offset_ptr;
-    bool matched_hash_id = false;
+    fingerprint_parse_csv_query(csv_data, fpQuery);
+    size_t qsize = fpQuery.size();
+    double time_csv;
+    GETCLOCKS(time_csv);
 
-    while(1){
-        s = p;
-        while(*p >= '0' && *p <= '9')p++;
+    fingerprint_parse_hashid_offsets(fpQuery, FPSongMaxTicketsMap);
+    size_t song_size = FPSongMaxTicketsMap.size();
+    double time_hashids;
+    GETCLOCKS(time_hashids);
 
-        a = *p;
-        if(a == '\0'){
-            break;
+    string result(nlargest * 8, 'A');
+    fingerprint_songs_rank(result, FPSongMaxTicketsMap, nlargest);
+    double time_rank;
+    GETCLOCKS(time_rank);
 
-        }else if(a == ','){
-            *p = '\0';
-            if(! matched_hash_id){
-                hash_id = atoi(s);
-                matched_hash_id = true;
-            }else{
-                matched_hash_id = false;
-            }
-
-        }else if(a =='\n'){
-            if(matched_hash_id){
-                *p = '\0';
-                offset =(uint16_t)atoi(s);
-
-                FPMatchDict::const_iterator got = BIG_DICT->find(hash_id);
-                if(got == BIG_DICT->end())continue;
-                o = got->second;
-                offsets_num = *(uint32_t *)o;
-                offset_ptr = (uint16_t *)(o + 4);
-                songid_ptr = (uint32_t *)(offset_ptr + offsets_num);
-                for(offset_idx=0; offset_idx < offsets_num; offset_idx++){
-                    FingerprintTickets[songid_ptr[offset_idx]][offset_ptr[offset_idx]-offset]++;
-                }
-            }
-            matched_hash_id = false;
-        }else if(a<'0' || a > '9'){
-            break;
-        }
-
-        p++;
-        continue;
-    }
-
-    string result;
-    fingerprint_rank(FingerprintTickets,  result, nlargest);
-
+    DEBUG("qsize:%lu, song_size:%lu, csv:%0.5f,  hashids_dict_time:%0.5f,  rank_time:%0.5f\n", \
+        qsize, song_size, time_csv-time_start, time_hashids - time_csv, time_rank - time_hashids);
     return result;
-}
-
-size_t read_nbytes(int fd, char *p, size_t n){
-    ssize_t num;
-    size_t readed_num = 0;
-
-    while (readed_num < n){
-        num = read(fd, p + readed_num, n - readed_num);
-        if(-1 == num){
-            int _err = errno;
-            FATAL("Error, read_nbytes, fd:%d, errno:%d, %s\n", fd, _err, strerror(_err));
-            return -1;
-        }
-
-        if(0 == num)break;
-        readed_num += num;
-    }
-
-    return readed_num;
 }
 
 char *mmapfile_init(string mmap_file_path){

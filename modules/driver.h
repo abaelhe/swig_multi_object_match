@@ -5,4 +5,4 @@
 int mmapfile_debug(int debug);
 char  *mmapfile_init(string mmap_file_path);
 string mmapfile_status();
-string mmapfile_compute_fingerprints(const char *csv_data, int nlargest);
+string mmapfile_compute_fingerprints(char *csv_data, size_t nlargest);

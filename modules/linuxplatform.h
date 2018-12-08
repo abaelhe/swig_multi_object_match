@@ -143,7 +143,7 @@ using namespace std;
 do { \
     struct timeval ___timer___; \
     gettimeofday(&___timer___,NULL); \
-    result=(double)___timer___.tv_sec*(double)CLOCKS_PER_SECOND+(double) ___timer___.tv_usec; \
+    result=((double)___timer___.tv_sec*(double)CLOCKS_PER_SECOND+(double) ___timer___.tv_usec)/CLOCKS_PER_SECOND; \
 }while(0);
 
 #define GETNTP(result) \
